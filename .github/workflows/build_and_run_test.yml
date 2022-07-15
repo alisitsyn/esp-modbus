@@ -1,0 +1,110 @@
+name: Build and Run Test Application
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Once per day at midnight
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  build:
+    name: Build Test App
+    strategy:
+      fail-fast: false
+      matrix:
+        idf_ver: ["release-v4.2", "release-v4.3", "release-v4.4", "latest"]
+        idf_target: ["esp32"]
+        idf_example: ["serial/mb_serial_master serial/mb_serial_slave tcp/mb_tcp_slave tcp/mb_tcp_master"]
+    runs-on: ubuntu-20.04
+    container: espressif/idf:${{ matrix.idf_ver }}
+    steps:
+      - uses: actions/checkout@v1
+        with:
+          submodules: 'true'
+      - name: Build Test Application
+        env:
+          IDF_TARGET: ${{ matrix.idf_target }}
+        shell: bash
+        working-directory: test
+        run: |
+          . ${IDF_PATH}/export.sh
+          cd ${{ matrix.idf_example }}
+          idf.py fullclean
+          echo "Building in $PWD with CMake for ${IDF_TARGET}"
+          idf.py build || die "CMake build in ${PWD} has failed for ${IDF_TARGET}"
+      - uses: actions/upload-artifact@v2
+        with:
+          name: test_app_bin_${{ matrix.idf_target }}_${{ matrix.idf_ver }}
+          path: |
+            test/${{ matrix.idf_example }}/build/bootloader/bootloader.bin
+            test/${{ matrix.idf_example }}/build/partition_table/partition-table.bin
+            test/${{ matrix.idf_example }}/build/partition_table/partition-table.bin
+            test/${{ matrix.idf_example }}/build/*.bin
+            test/${{ matrix.idf_example }}/build/*.elf
+            test/${{ matrix.idf_example }}/build/flasher_args.json
+  # Keeping this here for future reference. QEMU tests are not passing now
+  #run-qemu:
+  #  name: Run Test App in QEMU
+  #  needs: build
+  #  strategy:
+  #    matrix:
+  #      idf_ver: ["release-v4.4", "latest"] #FIXME: QEMU is crashing with v4.3 build
+  #  runs-on: ubuntu-20.04
+  #  container: ageon/pytest_env
+  #  steps:
+  #    - uses: actions/checkout@v2
+  #      with:
+  #        fetch-depth: 0
+  #    - uses: actions/download-artifact@v2
+  #      with:
+  #        name: test_app_bin_esp32_${{ matrix.idf_ver }}
+  #        path: test_app/build
+  #    - name: Run Test App in QEMU
+  #      working-directory: test_app
+  #      run: pytest -s --junit-xml=./test_app_results.xml --embedded-services qemu
+
+  run-target:
+    name: Run Test App on target
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        idf_ver: ["release-v4.3", "release-v4.4", "latest"]
+        idf_target: ["esp32"]
+    runs-on: [self-hosted, linux, docker, "${{ matrix.idf_target }}"]
+    container:
+      image: python:3.7-buster
+      options: --privileged # Privileged mode has access to serial ports
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/download-artifact@v2
+        with:
+          name: test_app_bin_${{ matrix.idf_target }}_${{ matrix.idf_ver }}
+          path: test/build
+      - name: Install Python packages
+        env:
+          PIP_EXTRA_INDEX_URL: "https://www.piwheels.org/simple"
+        run: pip install pytest-embedded pytest-embedded-serial-esp pytest-embedded-idf
+      - name: Run Test App on target
+        working-directory: test
+        run: pytest -s --junit-xml=./test_app_results_${{ matrix.idf_target }}_${{ matrix.idf_ver }}.xml --embedded-services esp,idf --target=${{ matrix.idf_target }}
+      - uses: actions/upload-artifact@v2
+        if: always()
+        with:
+          name: test_app_results_${{ matrix.idf_target }}_${{ matrix.idf_ver }}
+          path: test/*.xml
+
+  publish-results: # @todo fix this for public forks
+    name: Publish Test App results
+    needs: run-target
+    if: always() # Run even if the previous step failed
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Download Test results
+        uses: actions/download-artifact@v2
+        with:
+          path: test_results
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v1
+        with:
+          files: test_results/**/*.xml
